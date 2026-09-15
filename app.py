@@ -1,11 +1,12 @@
 """
 App tra cứu địa chỉ + số điện thoại doanh nghiệp từ mã số thuế (MST)
 Nguồn: VietQR (API) và masothue.com (đọc trang web, có thể bị chặn)
-Bản 4: tự điều chỉnh tốc độ gọi VietQR + nút tra lại các MST bị lỗi
+Bản 5: tự điều tốc VietQR, tra lại MST lỗi, tự chia lô (tối đa 100 MST/lô) và nghỉ giữa các lô
 """
 import io
 import re
 import threading
+import zipfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -238,16 +239,13 @@ def tra_1_mst(mst, dung_vqr, dung_mst, tt, nghi, ket_qua_cu):
     return dong
 
 
-def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi):
-    """Tra danh sách MST, ghi dần kết quả vào session_state."""
+def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi, khung):
+    """Tra 1 lô MST, ghi dần kết quả vào session_state. khung = các ô hiển thị dùng chung."""
     kq = st.session_state.setdefault("ket_qua", {})
     tt = TrangThaiChung(st.session_state.get("khoang_cach_vqr", 1.0))
-    thanh = st.progress(0.0)
-    dong_trang_thai = st.empty()
-    canh_bao = st.empty()
-    da_bao = False
     bat_dau = time.time()
     tong = len(ds_mst)
+    khung["lo_bar"].progress(0.0)
 
     pool = ThreadPoolExecutor(max_workers=so_luong)
     try:
@@ -258,28 +256,85 @@ def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi):
         for i, v in enumerate(as_completed(viec), 1):
             dong = v.result()
             kq[dong["MST chuẩn hóa"]] = dong
+            khung["da_xong"] += 1
 
-            if dung_mst and not tt.masothue_bat and not da_bao:
-                canh_bao.warning(
-                    "masothue chặn liên tục nên app đã bỏ qua nguồn này cho các MST còn lại."
+            if dung_mst and not tt.masothue_bat:
+                khung["canh_bao"].warning(
+                    "masothue chặn liên tục nên app đã bỏ qua nguồn này cho các MST còn lại của lô."
                 )
-                da_bao = True
 
             if i % 5 == 0 or i == tong:
                 da_chay = time.time() - bat_dau
                 toc_do = i / da_chay if da_chay else 0
-                con_lai = (tong - i) / toc_do / 60 if toc_do else 0
-                thanh.progress(i / tong)
+                khung["lo_bar"].progress(i / tong)
+                khung["tong_bar"].progress(khung["da_xong"] / khung["tong"])
                 nhip = (f" — nhịp VietQR: 1 lần/{tt.vqr.khoang_cach:.1f} giây, "
-                        f"đã bị giới hạn {tt.vqr.so_lan_bi_gioi_han} lần") if dung_vqr else ""
-                dong_trang_thai.write(
-                    f"Đã tra {i:,}/{tong:,} — còn khoảng {con_lai:,.0f} phút{nhip}"
+                        f"bị giới hạn {tt.vqr.so_lan_bi_gioi_han} lần") if dung_vqr else ""
+                khung["trang_thai"].write(
+                    f"Lô này: {i:,}/{tong:,} MST — tốc độ {toc_do:,.1f} MST/giây{nhip}"
                 )
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
-        # nhớ nhịp đang chạy ổn để lần sau (hoặc lúc tra lại) bắt đầu từ đó
         st.session_state["khoang_cach_vqr"] = tt.vqr.khoang_cach
-    dong_trang_thai.success(f"Xong {tong:,} MST trong {(time.time() - bat_dau) / 60:,.1f} phút.")
+
+
+def chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi, co_lo, nghi_giua_lo, ten_viec):
+    """Tự chia danh sách thành các lô nhỏ, tra lần lượt, nghỉ giữa các lô."""
+    cac_lo = [ds_mst[i:i + co_lo] for i in range(0, len(ds_mst), co_lo)]
+    st.markdown(f"**{ten_viec}: {len(ds_mst):,} MST, chia thành {len(cac_lo)} lô**")
+    khung = {
+        "tieu_de_lo": st.empty(),
+        "lo_bar": st.progress(0.0),
+        "trang_thai": st.empty(),
+        "tong_tieu_de": st.empty(),
+        "tong_bar": st.progress(0.0),
+        "dem_nguoc": st.empty(),
+        "canh_bao": st.empty(),
+        "da_xong": 0,
+        "tong": len(ds_mst),
+    }
+    bat_dau = time.time()
+    for k, lo in enumerate(cac_lo, 1):
+        khung["tieu_de_lo"].info(f"Đang tra lô {k}/{len(cac_lo)} ({len(lo)} MST)")
+        khung["tong_tieu_de"].caption(
+            f"Tổng tiến độ: {khung['da_xong']:,}/{khung['tong']:,} MST — đã chạy "
+            f"{(time.time() - bat_dau) / 60:,.1f} phút"
+        )
+        chay_tra_cuu(lo, dung_vqr, dung_mst, so_luong, nghi, khung)
+        st.session_state["lo_da_xong"] = k
+
+        if k < len(cac_lo) and nghi_giua_lo > 0:
+            for con in range(int(nghi_giua_lo), 0, -1):
+                khung["dem_nguoc"].write(
+                    f"Xong lô {k}. Nghỉ {con} giây rồi chạy lô {k + 1}..."
+                )
+                time.sleep(1)
+            khung["dem_nguoc"].empty()
+
+    khung["tieu_de_lo"].success(
+        f"Xong {len(cac_lo)} lô, {len(ds_mst):,} MST trong {(time.time() - bat_dau) / 60:,.1f} phút."
+    )
+    khung["tong_bar"].progress(1.0)
+
+
+@st.cache_data(show_spinner=False)
+def dong_goi_zip(df: pd.DataFrame, tien_to: str):
+    """Tách bảng theo cột 'Lô' thành nhiều file Excel, nén vào 1 file zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for lo, phan in df.dropna(subset=["Lô"]).groupby("Lô"):
+            b = io.BytesIO()
+            phan.to_excel(b, index=False, engine="openpyxl")
+            z.writestr(f"{tien_to}_lo_{int(lo):03d}.xlsx", b.getvalue())
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def ra_excel(df: pd.DataFrame):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Ket_qua")
+    return buf.getvalue()
 
 
 # ---------------- Giao diện ----------------
@@ -294,6 +349,11 @@ with st.sidebar:
     so_luong = st.slider("Số MST tra cùng lúc", 1, 5, 1,
                          help="VietQR đã có bộ tự điều tốc, để 1 là ổn nhất.")
     nghi = st.slider("Nghỉ sau mỗi lần tra masothue (giây)", 0.0, 3.0, 0.5, 0.5)
+    st.divider()
+    co_lo = st.slider("Số MST mỗi lô", 10, 100, 100, 10,
+                      help="File gốc được tự chia thành các lô nhỏ, tối đa 100 MST/lô.")
+    nghi_giua_lo = st.slider("Nghỉ giữa các lô (giây)", 0, 600, 60, 10,
+                             help="Cho VietQR/masothue \"nguội\" lại trước khi chạy lô tiếp theo.")
 
 tab_file, tab_dan = st.tabs(["Tải file lên", "Dán danh sách"])
 df_goc, cot_mst = None, None
@@ -322,48 +382,70 @@ if df_goc is not None:
     df_goc["MST chuẩn hóa"] = df_goc[cot_mst].apply(chuan_hoa_mst)
     ds_mst = df_goc["MST chuẩn hóa"].dropna().unique().tolist()
     so_loi = int(df_goc["MST chuẩn hóa"].isna().sum())
-    st.info(f"{len(ds_mst):,} MST hợp lệ (đã bỏ trùng), {so_loi:,} dòng MST không hợp lệ. "
-            "Giữ tab mở và không bấm gì khác trong lúc chạy.")
+    so_lo = -(-len(ds_mst) // co_lo)  # làm tròn lên
+
+    # đánh số lô cho từng MST
+    lo_cua_mst = {m: i // co_lo + 1 for i, m in enumerate(ds_mst)}
+    df_goc["Lô"] = df_goc["MST chuẩn hóa"].map(lo_cua_mst)
+
+    st.info(
+        f"{len(ds_mst):,} MST hợp lệ (đã bỏ trùng), {so_loi:,} dòng MST không hợp lệ. "
+        f"Sẽ chia thành {so_lo} lô, mỗi lô tối đa {co_lo} MST, nghỉ {nghi_giua_lo} giây giữa các lô. "
+        "Giữ tab mở và không bấm gì khác trong lúc chạy."
+    )
+    st.download_button(
+        f"Tải {so_lo} file nhỏ đã tách (zip)",
+        dong_goi_zip(df_goc, "file_goc"),
+        file_name="file_goc_da_tach.zip", mime="application/zip",
+    )
 
     dung_vqr, dung_mst = "VietQR" in nguon, "masothue" in nguon
 
     if st.button("Bắt đầu tra cứu", type="primary", disabled=not nguon):
         st.session_state["ket_qua"] = {}
-        chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi)
+        chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi,
+                     co_lo, nghi_giua_lo, "Tra cứu")
 
     kq = st.session_state.get("ket_qua", {})
     if kq:
-        # Nút tra lại: chỉ chạy các MST bị lỗi / chưa tra xong
+        # MST bị lỗi hoặc chưa tra (vd bấm Stop giữa chừng) -> tra lại, cũng chia lô
         loi_vqr = [m for m in ds_mst if dung_vqr and
                    str(kq.get(m, {}).get("Kết quả VietQR", "Lỗi")).startswith("Lỗi")]
         loi_mst = [m for m in ds_mst if dung_mst and
                    not str(kq.get(m, {}).get("Kết quả masothue", "")).startswith(("OK", "Không tìm thấy"))]
-        if loi_vqr or loi_mst:
-            if st.button(f"Tra lại {len(set(loi_vqr) | set(loi_mst)):,} MST bị lỗi hoặc chưa tra"):
+        so_can_tra = len(set(loi_vqr) | set(loi_mst))
+        if so_can_tra:
+            if st.button(f"Tra lại / tra tiếp {so_can_tra:,} MST bị lỗi hoặc chưa tra"):
                 if loi_vqr:
-                    chay_tra_cuu(loi_vqr, True, False, so_luong, nghi)
+                    chay_theo_lo(loi_vqr, True, False, so_luong, nghi,
+                                 co_lo, nghi_giua_lo, "Tra lại VietQR")
                 if loi_mst:
-                    chay_tra_cuu(loi_mst, False, True, so_luong, nghi)
+                    chay_theo_lo(loi_mst, False, True, so_luong, nghi,
+                                 co_lo, nghi_giua_lo, "Tra lại masothue")
                 kq = st.session_state["ket_qua"]
 
         df_kq = pd.DataFrame(kq.values())
         df_xuat = df_goc.merge(df_kq, on="MST chuẩn hóa", how="left")
 
-        st.subheader(f"Kết quả ({len(df_kq):,} MST đã tra)")
+        st.subheader(f"Kết quả ({len(df_kq):,}/{len(ds_mst):,} MST đã tra)")
         for cot in ["Kết quả VietQR", "Kết quả masothue"]:
             if cot in df_kq:
                 st.caption(f"{cot}: " + ", ".join(
                     f"{k}: {v:,}" for k, v in df_kq[cot].value_counts().items()))
 
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            df_xuat.to_excel(w, index=False, sheet_name="Ket_qua")
-        st.download_button(
-            "Tải file Excel kết quả", buf.getvalue(),
-            file_name="ket_qua_tra_cuu_mst.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "Tải kết quả gộp (1 file Excel)", ra_excel(df_xuat),
+                file_name="ket_qua_tra_cuu_mst.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        with c2:
+            st.download_button(
+                "Tải kết quả tách theo lô (zip)", dong_goi_zip(df_xuat, "ket_qua"),
+                file_name="ket_qua_theo_lo.zip", mime="application/zip",
+            )
         if len(df_xuat) > SO_DONG_HIEN_THI:
             st.caption(f"Chỉ hiện {SO_DONG_HIEN_THI} dòng đầu, file Excel có đủ {len(df_xuat):,} dòng.")
         st.dataframe(df_xuat.head(SO_DONG_HIEN_THI), use_container_width=True)
