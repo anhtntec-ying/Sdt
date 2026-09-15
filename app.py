@@ -1,7 +1,7 @@
 """
 App tra cứu địa chỉ + số điện thoại doanh nghiệp từ mã số thuế (MST)
-Nguồn: VietQR (API, ổn định) và masothue.com (đọc trang web, có thể bị chặn)
-Bản 3: tra nhiều MST cùng lúc (đa luồng), tự giảm tốc khi bị giới hạn
+Nguồn: VietQR (API) và masothue.com (đọc trang web, có thể bị chặn)
+Bản 4: tự điều chỉnh tốc độ gọi VietQR + nút tra lại các MST bị lỗi
 """
 import io
 import re
@@ -27,23 +27,57 @@ except Exception:
     )
 MST_SESSION.headers["Accept-Language"] = "vi-VN,vi;q=0.9"
 
-# Session có "hồ" kết nối đủ lớn cho nhiều luồng
 VQR_SESSION = requests.Session()
 VQR_SESSION.mount("https://", requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20))
 
 TIMEOUT = 10
 TAT_SAU_N_LAN_CHAN = 5
 SO_DONG_HIEN_THI = 200
-MASOTHUE_TOI_DA_CUNG_LUC = 2  # masothue dễ chặn -> tối đa 2 yêu cầu cùng lúc
+MASOTHUE_TOI_DA_CUNG_LUC = 2
+VQR_SO_LAN_THU = 8
 
 st.set_page_config(page_title="Tra cứu MST", page_icon="🔎", layout="wide")
 
 
-class TrangThaiChung:
-    """Thông tin dùng chung giữa các luồng trong 1 lần chạy."""
-    def __init__(self):
+# ---------------- Bộ điều tốc: tự chậm lại khi bị giới hạn, tự nhanh dần khi ổn ----------------
+class BoDieuToc:
+    def __init__(self, khoang_cach=1.0, nhanh_nhat=0.3, cham_nhat=30.0):
         self.lock = threading.Lock()
-        self.vqr_nghi_den = 0.0          # VietQR báo quá tải -> mọi luồng cùng chờ tới mốc này
+        self.khoang_cach = khoang_cach   # số giây giữa 2 lần gọi
+        self.nhanh_nhat = nhanh_nhat
+        self.cham_nhat = cham_nhat
+        self.luot_ke_tiep = 0.0
+        self.ok_lien_tiep = 0
+        self.so_lan_bi_gioi_han = 0
+
+    def cho_luot(self):
+        with self.lock:
+            bay_gio = time.time()
+            luot = max(bay_gio, self.luot_ke_tiep)
+            self.luot_ke_tiep = luot + self.khoang_cach
+        if luot > bay_gio:
+            time.sleep(luot - bay_gio)
+
+    def bao_bi_gioi_han(self, retry_after=None):
+        with self.lock:
+            self.so_lan_bi_gioi_han += 1
+            self.ok_lien_tiep = 0
+            self.khoang_cach = min(self.khoang_cach * 2, self.cham_nhat)
+            nghi = retry_after if retry_after else self.khoang_cach * 3
+            self.luot_ke_tiep = max(self.luot_ke_tiep, time.time() + nghi)
+
+    def bao_thanh_cong(self):
+        with self.lock:
+            self.ok_lien_tiep += 1
+            if self.ok_lien_tiep >= 20:  # 20 lần ổn liên tiếp -> nhanh lên 20%
+                self.khoang_cach = max(self.khoang_cach * 0.8, self.nhanh_nhat)
+                self.ok_lien_tiep = 0
+
+
+class TrangThaiChung:
+    def __init__(self, khoang_cach_vqr):
+        self.lock = threading.Lock()
+        self.vqr = BoDieuToc(khoang_cach_vqr)
         self.masothue_bat = True
         self.masothue_chan_lien_tiep = 0
         self.masothue_slot = threading.Semaphore(MASOTHUE_TOI_DA_CUNG_LUC)
@@ -79,32 +113,49 @@ def doc_file(noi_dung: bytes, ten_file: str):
 
 
 # ---------------- VietQR ----------------
+def _doc_retry_after(r):
+    try:
+        return float(r.headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
+
+
 def tra_vietqr(mst, tt):
     out = {"Tên DN (VietQR)": "", "Địa chỉ (VietQR)": "", "Kết quả VietQR": ""}
     loi = ""
-    for lan in range(5):
-        cho = tt.vqr_nghi_den - time.time()
-        if cho > 0:
-            time.sleep(cho)
+    for _ in range(VQR_SO_LAN_THU):
+        tt.vqr.cho_luot()
         try:
             r = VQR_SESSION.get(f"https://api.vietqr.io/v2/business/{mst}", timeout=TIMEOUT)
-            if r.status_code == 429:  # quá giới hạn -> cả nhóm cùng nghỉ
-                with tt.lock:
-                    tt.vqr_nghi_den = max(tt.vqr_nghi_den, time.time() + 2 * (lan + 1))
+            if r.status_code in (429, 403, 503):
+                tt.vqr.bao_bi_gioi_han(_doc_retry_after(r))
+                loi = f"bị giới hạn tốc độ ({r.status_code})"
                 continue
-            j = r.json()
+            try:
+                j = r.json()
+            except ValueError:  # trả về trang HTML thay vì dữ liệu -> coi như bị giới hạn
+                tt.vqr.bao_bi_gioi_han()
+                loi = f"phản hồi lạ ({r.status_code})"
+                continue
+            desc = str(j.get("desc") or "")
             if j.get("code") == "00" and j.get("data"):
                 d = j["data"]
                 out["Tên DN (VietQR)"] = d.get("name") or ""
                 out["Địa chỉ (VietQR)"] = d.get("address") or ""
                 out["Kết quả VietQR"] = "OK"
-            else:
-                out["Kết quả VietQR"] = j.get("desc") or "Không tìm thấy"
+                tt.vqr.bao_thanh_cong()
+                return out
+            if any(k in desc.lower() for k in ["limit", "too many", "quá nhiều", "giới hạn"]):
+                tt.vqr.bao_bi_gioi_han()
+                loi = f"bị giới hạn tốc độ ({desc[:40]})"
+                continue
+            out["Kết quả VietQR"] = desc or "Không tìm thấy"
+            tt.vqr.bao_thanh_cong()
             return out
         except Exception as e:
             loi = str(e)[:80]
-            time.sleep(1)
-    out["Kết quả VietQR"] = f"Lỗi: {loi or 'bị giới hạn tốc độ'}"
+            time.sleep(2)
+    out["Kết quả VietQR"] = f"Lỗi: {loi}"
     return out
 
 
@@ -178,13 +229,57 @@ def tra_masothue(mst, tt, nghi):
     return out
 
 
-def tra_1_mst(mst, dung_vqr, dung_mst, tt, nghi):
-    dong = {"MST chuẩn hóa": mst}
+def tra_1_mst(mst, dung_vqr, dung_mst, tt, nghi, ket_qua_cu):
+    dong = dict(ket_qua_cu or {"MST chuẩn hóa": mst})
     if dung_vqr:
         dong.update(tra_vietqr(mst, tt))
     if dung_mst:
         dong.update(tra_masothue(mst, tt, nghi))
     return dong
+
+
+def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi):
+    """Tra danh sách MST, ghi dần kết quả vào session_state."""
+    kq = st.session_state.setdefault("ket_qua", {})
+    tt = TrangThaiChung(st.session_state.get("khoang_cach_vqr", 1.0))
+    thanh = st.progress(0.0)
+    dong_trang_thai = st.empty()
+    canh_bao = st.empty()
+    da_bao = False
+    bat_dau = time.time()
+    tong = len(ds_mst)
+
+    pool = ThreadPoolExecutor(max_workers=so_luong)
+    try:
+        viec = [
+            pool.submit(tra_1_mst, m, dung_vqr, dung_mst, tt, nghi, kq.get(m))
+            for m in ds_mst
+        ]
+        for i, v in enumerate(as_completed(viec), 1):
+            dong = v.result()
+            kq[dong["MST chuẩn hóa"]] = dong
+
+            if dung_mst and not tt.masothue_bat and not da_bao:
+                canh_bao.warning(
+                    "masothue chặn liên tục nên app đã bỏ qua nguồn này cho các MST còn lại."
+                )
+                da_bao = True
+
+            if i % 5 == 0 or i == tong:
+                da_chay = time.time() - bat_dau
+                toc_do = i / da_chay if da_chay else 0
+                con_lai = (tong - i) / toc_do / 60 if toc_do else 0
+                thanh.progress(i / tong)
+                nhip = (f" — nhịp VietQR: 1 lần/{tt.vqr.khoang_cach:.1f} giây, "
+                        f"đã bị giới hạn {tt.vqr.so_lan_bi_gioi_han} lần") if dung_vqr else ""
+                dong_trang_thai.write(
+                    f"Đã tra {i:,}/{tong:,} — còn khoảng {con_lai:,.0f} phút{nhip}"
+                )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        # nhớ nhịp đang chạy ổn để lần sau (hoặc lúc tra lại) bắt đầu từ đó
+        st.session_state["khoang_cach_vqr"] = tt.vqr.khoang_cach
+    dong_trang_thai.success(f"Xong {tong:,} MST trong {(time.time() - bat_dau) / 60:,.1f} phút.")
 
 
 # ---------------- Giao diện ----------------
@@ -193,15 +288,12 @@ st.title("Tra cứu địa chỉ và số điện thoại theo MST")
 with st.sidebar:
     st.header("Cài đặt")
     nguon = st.multiselect(
-        "Nguồn tra cứu", ["VietQR", "masothue"], default=["VietQR", "masothue"],
+        "Nguồn tra cứu", ["VietQR", "masothue"], default=["VietQR"],
         help="VietQR chỉ có tên + địa chỉ. Số điện thoại chỉ lấy được từ masothue.",
     )
-    so_luong = st.slider(
-        "Số MST tra cùng lúc", 1, 10, 5,
-        help="Càng cao càng nhanh. Nếu thấy nhiều dòng báo lỗi/giới hạn thì giảm xuống.",
-    )
-    nghi = st.slider("Nghỉ sau mỗi lần tra masothue (giây)", 0.0, 3.0, 0.5, 0.5,
-                     help="Chỉ áp dụng cho masothue để đỡ bị chặn.")
+    so_luong = st.slider("Số MST tra cùng lúc", 1, 5, 1,
+                         help="VietQR đã có bộ tự điều tốc, để 1 là ổn nhất.")
+    nghi = st.slider("Nghỉ sau mỗi lần tra masothue (giây)", 0.0, 3.0, 0.5, 0.5)
 
 tab_file, tab_dan = st.tabs(["Tải file lên", "Dán danh sách"])
 df_goc, cot_mst = None, None
@@ -233,48 +325,28 @@ if df_goc is not None:
     st.info(f"{len(ds_mst):,} MST hợp lệ (đã bỏ trùng), {so_loi:,} dòng MST không hợp lệ. "
             "Giữ tab mở và không bấm gì khác trong lúc chạy.")
 
+    dung_vqr, dung_mst = "VietQR" in nguon, "masothue" in nguon
+
     if st.button("Bắt đầu tra cứu", type="primary", disabled=not nguon):
         st.session_state["ket_qua"] = {}
-        tt = TrangThaiChung()
-        thanh = st.progress(0.0)
-        dong_trang_thai = st.empty()
-        canh_bao = st.empty()
-        da_bao = False
-        bat_dau = time.time()
+        chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi)
 
-        pool = ThreadPoolExecutor(max_workers=so_luong)
-        try:
-            viec = [
-                pool.submit(tra_1_mst, m, "VietQR" in nguon, "masothue" in nguon, tt, nghi)
-                for m in ds_mst
-            ]
-            for i, v in enumerate(as_completed(viec), 1):
-                dong = v.result()
-                st.session_state["ket_qua"][dong["MST chuẩn hóa"]] = dong
+    kq = st.session_state.get("ket_qua", {})
+    if kq:
+        # Nút tra lại: chỉ chạy các MST bị lỗi / chưa tra xong
+        loi_vqr = [m for m in ds_mst if dung_vqr and
+                   str(kq.get(m, {}).get("Kết quả VietQR", "Lỗi")).startswith("Lỗi")]
+        loi_mst = [m for m in ds_mst if dung_mst and
+                   not str(kq.get(m, {}).get("Kết quả masothue", "")).startswith(("OK", "Không tìm thấy"))]
+        if loi_vqr or loi_mst:
+            if st.button(f"Tra lại {len(set(loi_vqr) | set(loi_mst)):,} MST bị lỗi hoặc chưa tra"):
+                if loi_vqr:
+                    chay_tra_cuu(loi_vqr, True, False, so_luong, nghi)
+                if loi_mst:
+                    chay_tra_cuu(loi_mst, False, True, so_luong, nghi)
+                kq = st.session_state["ket_qua"]
 
-                if not tt.masothue_bat and not da_bao and "masothue" in nguon:
-                    canh_bao.warning(
-                        "masothue chặn liên tục nên app đã tự bỏ qua nguồn này cho các MST còn lại. "
-                        "Lần sau nên bỏ chọn masothue để chạy nhanh hơn, hoặc chạy app trên laptop để lấy SĐT."
-                    )
-                    da_bao = True
-
-                if i % 10 == 0 or i == len(ds_mst):
-                    da_chay = time.time() - bat_dau
-                    toc_do = i / da_chay if da_chay else 0
-                    con_lai = (len(ds_mst) - i) / toc_do / 60 if toc_do else 0
-                    thanh.progress(i / len(ds_mst))
-                    dong_trang_thai.write(
-                        f"Đã tra {i:,}/{len(ds_mst):,} — tốc độ {toc_do:,.1f} MST/giây — "
-                        f"còn khoảng {con_lai:,.0f} phút"
-                    )
-        finally:
-            # bấm Stop giữa chừng thì hủy các việc chưa chạy
-            pool.shutdown(wait=False, cancel_futures=True)
-        dong_trang_thai.success(f"Tra cứu xong trong {(time.time() - bat_dau) / 60:,.1f} phút.")
-
-    if st.session_state.get("ket_qua"):
-        df_kq = pd.DataFrame(st.session_state["ket_qua"].values())
+        df_kq = pd.DataFrame(kq.values())
         df_xuat = df_goc.merge(df_kq, on="MST chuẩn hóa", how="left")
 
         st.subheader(f"Kết quả ({len(df_kq):,} MST đã tra)")
