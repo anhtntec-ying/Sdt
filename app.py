@@ -1,7 +1,7 @@
 """
 App tra cứu địa chỉ + số điện thoại doanh nghiệp từ mã số thuế (MST)
 Nguồn: VietQR (API) và masothue.com (đọc trang web, có thể bị chặn)
-Bản 5: tự điều tốc VietQR, tra lại MST lỗi, tự chia lô (tối đa 100 MST/lô) và nghỉ giữa các lô
+Bản 8: + nguồn thongtindoanhnghiep.co (TTDN) và thongtincongty.vn (TTCT), cột tổng hợp
 """
 import io
 import re
@@ -82,6 +82,12 @@ class TrangThaiChung:
         self.masothue_bat = True
         self.masothue_chan_lien_tiep = 0
         self.masothue_slot = threading.Semaphore(MASOTHUE_TOI_DA_CUNG_LUC)
+        self.ttdn = BoDieuToc(1.5)
+        self.ttdn_bat = True
+        self.ttdn_chan_lien_tiep = 0
+        self.ttct = BoDieuToc(1.5)
+        self.ttct_bat = True
+        self.ttct_chan_lien_tiep = 0
 
 
 # ---------------- Chuẩn hóa MST ----------------
@@ -230,16 +236,239 @@ def tra_masothue(mst, tt, nghi):
     return out
 
 
-def tra_1_mst(mst, dung_vqr, dung_mst, tt, nghi, ket_qua_cu):
-    dong = dict(ket_qua_cu or {"MST chuẩn hóa": mst})
-    if dung_vqr:
-        dong.update(tra_vietqr(mst, tt))
-    if dung_mst:
-        dong.update(tra_masothue(mst, tt, nghi))
+# ---------------- thongtindoanhnghiep.co (TTDN) - nguồn dự phòng ----------------
+# Tên các trường dữ liệu của nguồn này không được công bố rõ, nên đọc "mềm":
+# tìm khóa có chứa chữ khóa phù hợp, bỏ qua các khóa của cơ quan thuế quản lý.
+def _lay_truong(d, uu_tien, chua, loai_tru=()):
+    phang = {
+        re.sub(r"[^a-z0-9]", "", str(k).lower()): v
+        for k, v in d.items()
+        if isinstance(v, (str, int, float)) and str(v).strip() not in ("", "None", "null")
+    }
+    for k in uu_tien:
+        if k in phang:
+            return str(phang[k]).strip()
+    for k, v in phang.items():
+        if any(c in k for c in chua) and not any(x in k for x in loai_tru):
+            return str(v).strip()
+    return ""
+
+
+def tra_ttdn(mst, tt):
+    out = {"Tên DN (TTDN)": "", "Địa chỉ (TTDN)": "", "SĐT (TTDN)": "", "Kết quả TTDN": ""}
+    if not tt.ttdn_bat:
+        out["Kết quả TTDN"] = "Bỏ qua (đã tắt do bị chặn)"
+        return out
+    loi = ""
+    for _ in range(3):
+        tt.ttdn.cho_luot()
+        try:
+            r = MST_SESSION.get(f"https://thongtindoanhnghiep.co/api/company/{mst}", timeout=TIMEOUT)
+            if r.status_code in (403, 429, 503) or "Just a moment" in r.text[:3000]:
+                tt.ttdn.bao_bi_gioi_han(_doc_retry_after(r))
+                loi = f"Bị chặn ({r.status_code})"
+                continue
+            if r.status_code == 404:
+                out["Kết quả TTDN"] = "Không tìm thấy"
+                break
+            try:
+                j = r.json()
+            except ValueError:
+                loi = f"Bị chặn (phản hồi không phải dữ liệu, {r.status_code})"
+                tt.ttdn.bao_bi_gioi_han()
+                continue
+            if isinstance(j, dict) and isinstance(j.get("data"), dict):
+                j = j["data"]
+            if not isinstance(j, dict) or not j:
+                out["Kết quả TTDN"] = "Không tìm thấy"
+                break
+            loai_tru_cqt = ("noidangky", "noinopthue", "coquanthue", "nhanthongbao")
+            out["Tên DN (TTDN)"] = _lay_truong(
+                j, ["title", "ten", "tencongty", "tendoanhnghiep", "name"],
+                ["tencongty", "tendoanhnghiep"], loai_tru_cqt + ("en", "viettat"))
+            out["Địa chỉ (TTDN)"] = _lay_truong(
+                j, ["diachicongty", "diachi", "address"], ["diachi", "address"], loai_tru_cqt)
+            out["SĐT (TTDN)"] = _lay_truong(
+                j, ["dienthoai", "sodienthoai", "phone"], ["dienthoai", "phone"],
+                loai_tru_cqt + ("fax",))
+            if out["Tên DN (TTDN)"] or out["Địa chỉ (TTDN)"]:
+                out["Kết quả TTDN"] = "OK"
+            else:
+                out["Kết quả TTDN"] = "Không đọc được (khóa: " + ", ".join(list(j)[:8]) + ")"
+            tt.ttdn.bao_thanh_cong()
+            break
+        except Exception as e:
+            loi = f"Lỗi: {str(e)[:80]}"
+            time.sleep(2)
+    else:
+        out["Kết quả TTDN"] = loi or "Lỗi"
+
+    with tt.lock:
+        if out["Kết quả TTDN"].startswith(("Bị chặn", "Lỗi")):
+            tt.ttdn_chan_lien_tiep += 1
+            if tt.ttdn_chan_lien_tiep >= TAT_SAU_N_LAN_CHAN:
+                tt.ttdn_bat = False
+        else:
+            tt.ttdn_chan_lien_tiep = 0
+    return out
+
+
+# ---------------- thongtincongty.vn (TTCT) ----------------
+# Trang chi tiết có dạng /ma-so-thue/<MST>-<tên-viết-liền>, dữ liệu nằm trong 1 bảng 2 cột:
+# Mã số thuế | Tên đơn vị | Địa chỉ theo CQT | Địa chỉ sau sáp nhập | Trạng thái | Cơ quan thuế quản lý
+# Trang này KHÔNG có số điện thoại.
+TTCT_GOC = "https://thongtincongty.vn"
+
+
+def _ttct_doc_bang(soup, mst):
+    """Đọc bảng thông tin; trả về dict hoặc None nếu trang không phải trang của MST này."""
+    du_lieu = {}
+    for tr in soup.find_all("tr"):
+        o = tr.find_all(["th", "td"])
+        if len(o) >= 2:
+            du_lieu[o[0].get_text(" ", strip=True).lower()] = o[1]
+    o_mst = du_lieu.get("mã số thuế")
+    if o_mst is None or mst not in o_mst.get_text(" ", strip=True):
+        return None
+    return du_lieu
+
+
+def _ttct_link(soup, mst):
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        duong_dan = href.replace(TTCT_GOC, "")
+        if duong_dan.startswith(f"/ma-so-thue/{mst}-") or duong_dan.rstrip("/") == f"/ma-so-thue/{mst}":
+            return TTCT_GOC + duong_dan
+    return None
+
+
+def tra_ttct(mst, tt):
+    out = {
+        "Tên DN (TTCT)": "", "Địa chỉ (TTCT)": "", "Địa chỉ sau sáp nhập (TTCT)": "",
+        "Trạng thái (TTCT)": "", "Kết quả TTCT": "",
+    }
+    if not tt.ttct_bat:
+        out["Kết quả TTCT"] = "Bỏ qua (đã tắt do bị chặn)"
+        return out
+
+    def lay(url, **kw):
+        tt.ttct.cho_luot()
+        r = MST_SESSION.get(url, timeout=TIMEOUT, **kw)
+        if r.status_code in (403, 429, 503) or "Just a moment" in r.text[:3000]:
+            tt.ttct.bao_bi_gioi_han(_doc_retry_after(r))
+            raise PermissionError(f"Bị chặn ({r.status_code})")
+        tt.ttct.bao_thanh_cong()
+        return r
+
+    ket_qua = ""
+    for _ in range(2):
+        try:
+            bang = None
+            # thử lần lượt: link trực tiếp theo MST, rồi các kiểu trang tìm kiếm
+            ung_vien = [
+                (f"{TTCT_GOC}/ma-so-thue/{mst}", {}),
+                (f"{TTCT_GOC}/tim-kiem", {"params": {"q": mst}}),
+                (f"{TTCT_GOC}/", {"params": {"q": mst}}),
+            ]
+            for url, kw in ung_vien:
+                r = lay(url, **kw)
+                if r.status_code >= 400:
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                bang = _ttct_doc_bang(soup, mst)
+                if bang is None:
+                    link = _ttct_link(soup, mst)
+                    if link:
+                        soup = BeautifulSoup(lay(link).text, "html.parser")
+                        bang = _ttct_doc_bang(soup, mst)
+                if bang is not None:
+                    break
+            if bang is None:
+                ket_qua = "Không tìm thấy"
+                break
+
+            def gt(nhan):
+                o = bang.get(nhan)
+                return o.get_text(" ", strip=True) if o is not None else ""
+
+            out["Tên DN (TTCT)"] = gt("tên đơn vị") or gt("tên công ty") or gt("tên doanh nghiệp")
+            out["Địa chỉ (TTCT)"] = gt("địa chỉ theo cqt") or gt("địa chỉ")
+            out["Trạng thái (TTCT)"] = gt("trạng thái")
+            sap_nhap = gt("địa chỉ sau sáp nhập")
+            m = re.search(r"Địa chỉ 1\s*:?\s*(.+?)(?:\s*-\s*Căn cứ|\s*---|$)", sap_nhap)
+            out["Địa chỉ sau sáp nhập (TTCT)"] = m.group(1).strip(" -") if m else ""
+            ket_qua = "OK" if (out["Tên DN (TTCT)"] or out["Địa chỉ (TTCT)"]) else "Không đọc được trang"
+            break
+        except PermissionError as e:
+            ket_qua = str(e)
+        except Exception as e:
+            ket_qua = f"Lỗi: {str(e)[:80]}"
+            time.sleep(2)
+    out["Kết quả TTCT"] = ket_qua or "Lỗi"
+
+    with tt.lock:
+        if out["Kết quả TTCT"].startswith(("Bị chặn", "Lỗi")):
+            tt.ttct_chan_lien_tiep += 1
+            if tt.ttct_chan_lien_tiep >= TAT_SAU_N_LAN_CHAN:
+                tt.ttct_bat = False
+        else:
+            tt.ttct_chan_lien_tiep = 0
+    return out
+
+
+def _dau_tien(dong, cac_cot):
+    for c in cac_cot:
+        v = dong.get(c)
+        if v is not None and str(v).strip() not in ("", "nan"):
+            return str(v).strip()
+    return ""
+
+
+def them_cot_tong_hop(dong):
+    # lấy giá trị đầu tiên có dữ liệu theo thứ tự ưu tiên nguồn
+    dong["Tên DN (tổng hợp)"] = _dau_tien(
+        dong, ["Tên DN (VietQR)", "Tên DN (TTDN)", "Tên DN (TTCT)", "Tên DN (masothue)"])
+    dong["Địa chỉ (tổng hợp)"] = _dau_tien(
+        dong, ["Địa chỉ (VietQR)", "Địa chỉ (TTDN)", "Địa chỉ (TTCT)", "Địa chỉ (masothue)"])
+    dong["SĐT (tổng hợp)"] = _dau_tien(dong, ["SĐT (masothue)", "SĐT (TTDN)"])
     return dong
 
 
-def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi, khung):
+def vqr_loi(dong):
+    return str(dong.get("Kết quả VietQR", "Lỗi")).startswith("Lỗi")
+
+
+def ttdn_ok(dong):
+    return str(dong.get("Kết quả TTDN", "")).startswith(("OK", "Không tìm thấy"))
+
+
+def ttct_ok(dong):
+    return str(dong.get("Kết quả TTCT", "")).startswith(("OK", "Không tìm thấy"))
+
+
+def du_phong_da_co(dong):
+    """Có ít nhất 1 nguồn dự phòng tra ra dữ liệu."""
+    return any(str(dong.get(c, "")).startswith("OK") for c in ["Kết quả TTDN", "Kết quả TTCT"])
+
+
+def tra_1_mst(mst, dung_vqr, dung_mst, tt, nghi, ket_qua_cu,
+              dung_ttdn=False, du_phong=False, dung_ttct=False):
+    dong = dict(ket_qua_cu or {"MST chuẩn hóa": mst})
+    if dung_vqr:
+        dong.update(tra_vietqr(mst, tt))
+    can_du_phong = du_phong and dung_vqr and vqr_loi(dong)
+    # Dự phòng theo thứ tự: VietQR lỗi -> TTDN -> (TTDN chưa ra) -> TTCT
+    if dung_ttdn or can_du_phong:
+        dong.update(tra_ttdn(mst, tt))
+    if dung_ttct or (can_du_phong and not str(dong.get("Kết quả TTDN", "")).startswith("OK")):
+        dong.update(tra_ttct(mst, tt))
+    if dung_mst:
+        dong.update(tra_masothue(mst, tt, nghi))
+    return them_cot_tong_hop(dong)
+
+
+def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi, khung,
+                 dung_ttdn=False, du_phong=False, dung_ttct=False):
     """Tra 1 lô MST, ghi dần kết quả vào session_state. khung = các ô hiển thị dùng chung."""
     kq = st.session_state.setdefault("ket_qua", {})
     tt = TrangThaiChung(st.session_state.get("khoang_cach_vqr", 1.0))
@@ -250,7 +479,8 @@ def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi, khung):
     pool = ThreadPoolExecutor(max_workers=so_luong)
     try:
         viec = [
-            pool.submit(tra_1_mst, m, dung_vqr, dung_mst, tt, nghi, kq.get(m))
+            pool.submit(tra_1_mst, m, dung_vqr, dung_mst, tt, nghi, kq.get(m),
+                        dung_ttdn, du_phong, dung_ttct)
             for m in ds_mst
         ]
         for i, v in enumerate(as_completed(viec), 1):
@@ -261,6 +491,16 @@ def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi, khung):
             if dung_mst and not tt.masothue_bat:
                 khung["canh_bao"].warning(
                     "masothue chặn liên tục nên app đã bỏ qua nguồn này cho các MST còn lại của lô."
+                )
+
+            if (dung_ttdn or du_phong) and not tt.ttdn_bat:
+                khung["canh_bao_ttdn"].warning(
+                    "thongtindoanhnghiep.co chặn liên tục nên app đã bỏ qua nguồn này cho phần còn lại của lô."
+                )
+
+            if (dung_ttct or du_phong) and not tt.ttct_bat:
+                khung["canh_bao_ttct"].warning(
+                    "thongtincongty.vn chặn liên tục nên app đã bỏ qua nguồn này cho phần còn lại của lô."
                 )
 
             if i % 5 == 0 or i == tong:
@@ -278,7 +518,8 @@ def chay_tra_cuu(ds_mst, dung_vqr, dung_mst, so_luong, nghi, khung):
         st.session_state["khoang_cach_vqr"] = tt.vqr.khoang_cach
 
 
-def chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi, co_lo, nghi_giua_lo, ten_viec):
+def chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi, co_lo, nghi_giua_lo, ten_viec,
+                 dung_ttdn=False, du_phong=False, dung_ttct=False):
     """Tự chia danh sách thành các lô nhỏ, tra lần lượt, nghỉ giữa các lô."""
     cac_lo = [ds_mst[i:i + co_lo] for i in range(0, len(ds_mst), co_lo)]
     st.markdown(f"**{ten_viec}: {len(ds_mst):,} MST, chia thành {len(cac_lo)} lô**")
@@ -290,6 +531,8 @@ def chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi, co_lo, nghi_giua_lo
         "tong_bar": st.progress(0.0),
         "dem_nguoc": st.empty(),
         "canh_bao": st.empty(),
+        "canh_bao_ttdn": st.empty(),
+        "canh_bao_ttct": st.empty(),
         "da_xong": 0,
         "tong": len(ds_mst),
     }
@@ -300,7 +543,7 @@ def chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi, co_lo, nghi_giua_lo
             f"Tổng tiến độ: {khung['da_xong']:,}/{khung['tong']:,} MST — đã chạy "
             f"{(time.time() - bat_dau) / 60:,.1f} phút"
         )
-        chay_tra_cuu(lo, dung_vqr, dung_mst, so_luong, nghi, khung)
+        chay_tra_cuu(lo, dung_vqr, dung_mst, so_luong, nghi, khung, dung_ttdn, du_phong, dung_ttct)
         st.session_state["lo_da_xong"] = k
 
         if k < len(cac_lo) and nghi_giua_lo > 0:
@@ -337,14 +580,91 @@ def ra_excel(df: pd.DataFrame):
     return buf.getvalue()
 
 
+def tong_hop_loi(df_xuat, dung_vqr, dung_mst, dung_ttdn=False, dung_ttct=False):
+    """Gom MST có vấn đề thành 3 nhóm, mỗi nhóm 1 sheet, kèm cột 'Lý do'."""
+    def ly_do(dong):
+        cac_ly_do = []
+        kq_vqr = str(dong.get("Kết quả VietQR") or "")
+        kq_mst = str(dong.get("Kết quả masothue") or "")
+        kq_ttdn = str(dong.get("Kết quả TTDN") or "")
+        kq_ttct = str(dong.get("Kết quả TTCT") or "")
+        if dung_vqr and (kq_vqr in ("", "nan") or kq_vqr.startswith("Lỗi")) and not du_phong_da_co(dong):
+            ly = "VietQR: " + (kq_vqr if kq_vqr not in ("", "nan") else "chưa tra")
+            for ten, kq_dp in [("TTDN", kq_ttdn), ("TTCT", kq_ttct)]:
+                if kq_dp not in ("", "nan"):
+                    ly += f" | {ten}: {kq_dp}"
+            cac_ly_do.append(ly)
+        if not dung_vqr:
+            if dung_ttdn and not ttdn_ok(dong):
+                cac_ly_do.append("TTDN: " + (kq_ttdn if kq_ttdn not in ("", "nan") else "chưa tra"))
+            if dung_ttct and not ttct_ok(dong):
+                cac_ly_do.append("TTCT: " + (kq_ttct if kq_ttct not in ("", "nan") else "chưa tra"))
+        if dung_mst and not kq_mst.startswith(("OK", "Không tìm thấy")):
+            cac_ly_do.append("masothue: " + (kq_mst if kq_mst not in ("", "nan") else "chưa tra"))
+        return "; ".join(cac_ly_do)
+
+    def khong_thay(dong):
+        kq_vqr = str(dong.get("Kết quả VietQR") or "")
+        kq_mst = str(dong.get("Kết quả masothue") or "")
+        ly = []
+        kq_ttdn = str(dong.get("Kết quả TTDN") or "")
+        if dung_vqr and kq_vqr not in ("", "nan", "OK") and not kq_vqr.startswith("Lỗi"):
+            ly.append("VietQR: " + kq_vqr)
+        kq_ttct = str(dong.get("Kết quả TTCT") or "")
+        if kq_vqr != "OK" and not du_phong_da_co(dong):
+            if kq_ttdn.startswith("Không tìm thấy"):
+                ly.append("TTDN: không tìm thấy")
+            if kq_ttct.startswith("Không tìm thấy"):
+                ly.append("TTCT: không tìm thấy")
+        if dung_mst and kq_mst.startswith("Không tìm thấy"):
+            ly.append("masothue: không tìm thấy")
+        return "; ".join(ly)
+
+    hop_le = df_xuat[df_xuat["MST chuẩn hóa"].notna()].copy()
+
+    sai_dinh_dang = df_xuat[df_xuat["MST chuẩn hóa"].isna()].copy()
+    sai_dinh_dang.insert(0, "Lý do", "MST sai định dạng (không đủ 10 hoặc 13 số)")
+
+    loi = hop_le.copy()
+    loi.insert(0, "Lý do", loi.apply(ly_do, axis=1))
+    loi = loi[loi["Lý do"] != ""]
+
+    kt = hop_le.copy()
+    kt.insert(0, "Lý do", kt.apply(khong_thay, axis=1))
+    kt = kt[(kt["Lý do"] != "") & (~kt["MST chuẩn hóa"].isin(loi["MST chuẩn hóa"]))]
+
+    return {
+        "Loi_tra_cuu": loi,           # lỗi kết nối, bị chặn/giới hạn, chưa tra -> nên tra lại
+        "Khong_tim_thay": kt,         # nguồn trả lời là không có dữ liệu -> kiểm tra lại MST
+        "MST_sai_dinh_dang": sai_dinh_dang,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def ra_excel_nhieu_sheet(cac_sheet: dict):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        for ten, df in cac_sheet.items():
+            df.to_excel(w, index=False, sheet_name=ten)
+    return buf.getvalue()
+
+
 # ---------------- Giao diện ----------------
 st.title("Tra cứu địa chỉ và số điện thoại theo MST")
 
 with st.sidebar:
     st.header("Cài đặt")
     nguon = st.multiselect(
-        "Nguồn tra cứu", ["VietQR", "masothue"], default=["VietQR"],
-        help="VietQR chỉ có tên + địa chỉ. Số điện thoại chỉ lấy được từ masothue.",
+        "Nguồn tra cứu", ["VietQR", "thongtindoanhnghiep", "thongtincongty", "masothue"],
+        default=["VietQR"],
+        help="VietQR: tên + địa chỉ. thongtindoanhnghiep: tên + địa chỉ (+ SĐT nếu có). "
+             "thongtincongty: tên + địa chỉ + địa chỉ sau sáp nhập + trạng thái (không có SĐT). "
+             "masothue: tên + địa chỉ + SĐT nhưng hay bị chặn.",
+    )
+    du_phong = st.checkbox(
+        "Khi VietQR lỗi, tự tra thay bằng thongtindoanhnghiep → thongtincongty", value=True,
+        help="Chỉ gọi nguồn dự phòng cho những MST mà VietQR báo lỗi/giới hạn. "
+             "thongtincongty chỉ được gọi nếu thongtindoanhnghiep cũng không ra.",
     )
     so_luong = st.slider("Số MST tra cùng lúc", 1, 5, 1,
                          help="VietQR đã có bộ tự điều tốc, để 1 là ổn nhất.")
@@ -400,25 +720,37 @@ if df_goc is not None:
     )
 
     dung_vqr, dung_mst = "VietQR" in nguon, "masothue" in nguon
+    dung_ttdn = "thongtindoanhnghiep" in nguon
+    dung_ttct = "thongtincongty" in nguon
 
     if st.button("Bắt đầu tra cứu", type="primary", disabled=not nguon):
         st.session_state["ket_qua"] = {}
         chay_theo_lo(ds_mst, dung_vqr, dung_mst, so_luong, nghi,
-                     co_lo, nghi_giua_lo, "Tra cứu")
+                     co_lo, nghi_giua_lo, "Tra cứu", dung_ttdn, du_phong, dung_ttct)
 
     kq = st.session_state.get("ket_qua", {})
     if kq:
         # MST bị lỗi hoặc chưa tra (vd bấm Stop giữa chừng) -> tra lại, cũng chia lô
         loi_vqr = [m for m in ds_mst if dung_vqr and
-                   str(kq.get(m, {}).get("Kết quả VietQR", "Lỗi")).startswith("Lỗi")]
+                   vqr_loi(kq.get(m, {})) and not du_phong_da_co(kq.get(m, {}))]
+        loi_ttdn = [m for m in ds_mst if dung_ttdn and not dung_vqr and
+                    not ttdn_ok(kq.get(m, {}))]
+        loi_ttct = [m for m in ds_mst if dung_ttct and not dung_vqr and
+                    not ttct_ok(kq.get(m, {}))]
         loi_mst = [m for m in ds_mst if dung_mst and
                    not str(kq.get(m, {}).get("Kết quả masothue", "")).startswith(("OK", "Không tìm thấy"))]
-        so_can_tra = len(set(loi_vqr) | set(loi_mst))
+        so_can_tra = len(set(loi_vqr) | set(loi_mst) | set(loi_ttdn) | set(loi_ttct))
         if so_can_tra:
             if st.button(f"Tra lại / tra tiếp {so_can_tra:,} MST bị lỗi hoặc chưa tra"):
                 if loi_vqr:
                     chay_theo_lo(loi_vqr, True, False, so_luong, nghi,
-                                 co_lo, nghi_giua_lo, "Tra lại VietQR")
+                                 co_lo, nghi_giua_lo, "Tra lại VietQR", False, du_phong)
+                if loi_ttdn:
+                    chay_theo_lo(loi_ttdn, False, False, so_luong, nghi,
+                                 co_lo, nghi_giua_lo, "Tra lại thongtindoanhnghiep", True, False)
+                if loi_ttct:
+                    chay_theo_lo(loi_ttct, False, False, so_luong, nghi,
+                                 co_lo, nghi_giua_lo, "Tra lại thongtincongty", False, False, True)
                 if loi_mst:
                     chay_theo_lo(loi_mst, False, True, so_luong, nghi,
                                  co_lo, nghi_giua_lo, "Tra lại masothue")
@@ -426,12 +758,42 @@ if df_goc is not None:
 
         df_kq = pd.DataFrame(kq.values())
         df_xuat = df_goc.merge(df_kq, on="MST chuẩn hóa", how="left")
+        cot_tong_hop = [c for c in ["Tên DN (tổng hợp)", "Địa chỉ (tổng hợp)", "SĐT (tổng hợp)"]
+                        if c in df_xuat]
+        cot_khac = [c for c in df_xuat.columns if c not in cot_tong_hop]
+        vi_tri = cot_khac.index("Lô") + 1 if "Lô" in cot_khac else len(cot_khac)
+        df_xuat = df_xuat[cot_khac[:vi_tri] + cot_tong_hop + cot_khac[vi_tri:]]
 
         st.subheader(f"Kết quả ({len(df_kq):,}/{len(ds_mst):,} MST đã tra)")
-        for cot in ["Kết quả VietQR", "Kết quả masothue"]:
+        for cot in ["Kết quả VietQR", "Kết quả TTDN", "Kết quả TTCT", "Kết quả masothue"]:
             if cot in df_kq:
                 st.caption(f"{cot}: " + ", ".join(
                     f"{k}: {v:,}" for k, v in df_kq[cot].value_counts().items()))
+
+        # ---- File tổng hợp MST lỗi ----
+        nhom_loi = tong_hop_loi(df_xuat, dung_vqr, dung_mst, dung_ttdn, dung_ttct)
+        n_loi = len(nhom_loi["Loi_tra_cuu"])
+        n_kt = len(nhom_loi["Khong_tim_thay"])
+        n_sai = len(nhom_loi["MST_sai_dinh_dang"])
+        if n_loi + n_kt + n_sai:
+            st.warning(
+                f"Có {n_loi:,} dòng tra bị lỗi/chưa tra, {n_kt:,} dòng không tìm thấy dữ liệu, "
+                f"{n_sai:,} dòng MST sai định dạng."
+            )
+            st.download_button(
+                f"Tải file MST lỗi ({n_loi + n_kt + n_sai:,} dòng, 3 sheet)",
+                ra_excel_nhieu_sheet(nhom_loi),
+                file_name="mst_bi_loi.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            with st.expander("Xem nhanh các dòng tra bị lỗi"):
+                st.dataframe(
+                    nhom_loi["Loi_tra_cuu"][["Lý do", cot_mst, "MST chuẩn hóa", "Lô"]]
+                    .head(SO_DONG_HIEN_THI),
+                    use_container_width=True,
+                )
+        else:
+            st.success("Không có MST nào bị lỗi.")
 
         c1, c2 = st.columns(2)
         with c1:
